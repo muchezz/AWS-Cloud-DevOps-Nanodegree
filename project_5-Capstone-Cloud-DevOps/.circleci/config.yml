@@ -1,0 +1,304 @@
+commands:
+  destroy-cluster:
+    description: Destroy EKS Cluster.
+    parameters:
+        cluster-name:
+          description: |
+            Name of the EKS cluster
+          type: string
+          
+    steps:
+      - run:
+          name: Destroy environments
+          when: on_fail
+          command: |
+            aws cloudformation delete-stack --stack-name eksctl-devopscapstone-nodegroup-nodegroup --region eu-west-2
+            aws cloudformation delete-stack --stack-name eksctl-<< parameters.cluster-name >>-cluster --region eu-west-2
+
+
+parameters:
+  docker_image:
+    type: string
+    default: python:3.10.0-bullseye 
+
+jobs:
+  linting:
+    docker:
+      - image: << pipeline.parameters.docker_image >>
+    
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "requirements.txt" }}
+            
+            - v1-dependencies-
+      - run:
+          name: install dependencies
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            make install
+            # Install hadolint
+            wget -O /bin/hadolint https://github.com/hadolint/hadolint/releases/download/v1.16.3/hadolint-Linux-x86_64 &&\
+                chmod +x /bin/hadolint
+      - save_cache:
+          paths:
+            - ./venv
+          key: v1-dependencies-{{ checksum "requirements.txt" }}
+          
+      - run:
+          name: run lint
+          command: |
+            . venv/bin/activate
+            make lint     
+
+  build-and-push-image:
+    machine: true
+    steps:
+         - checkout
+         - run: |
+            docker build -t greentropikal/covid19-analysis:latest .
+            echo $DOCKERHUB_PASSWORD | docker login -u $DOCKER_USER --password-stdin
+            docker push greentropikal/covid19-analysis:latest
+
+
+  # Creation of Cluster        
+  create-cluster:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+        default: covid19-analysis
+    steps:
+      - run:
+          name: Install the eksctl tool
+          command: |
+            if which eksctl > /dev/null; then
+              echo "eksctl is already installed"
+              exit 0
+            fi
+            mkdir -p eksctl_download
+            curl --silent --location --retry 5 "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+              | tar xz -C eksctl_download
+            chmod +x eksctl_download/eksctl
+            SUDO=""
+            if [ $(id -u) -ne 0 ] && which sudo > /dev/null ; then
+              SUDO="sudo"
+            fi
+            $SUDO mv eksctl_download/eksctl /usr/local/bin/
+            rmdir eksctl_download
+      - aws-eks/install-aws-iam-authenticator:
+          release-tag: ''
+      - aws-eks/create-cluster:
+          cluster-name: covid19-analysis
+          node-type: t3.medium
+          
+
+   # Test the Cluster               
+  test-cluster:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+    steps:
+      - kubernetes/install
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+      - run:
+          command: |
+            kubectl get services
+            kubectl get pods
+            kubectl describe pods
+            kubectl get nodes
+            kubectl get deployment
+            kubectl get services -o wide
+          name: Test cluster
+
+  # Deploy the Application
+  deploy-application:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+      aws-region:
+        description: |
+          AWS region
+        type: string
+        default: ""
+    steps:
+      - checkout
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - kubernetes/create-or-update-resource:
+          get-rollout-status: true
+          resource-file-path: deployment/deployV1.yml
+          resource-name: deployment/covid19-analysis
+      - kubernetes/create-or-update-resource:
+          resource-file-path: deployment/app-service.yml
+
+  update_deployment:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+    steps:
+      - checkout
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+      - kubernetes/create-or-update-resource:
+          get-rollout-status: true
+          resource-file-path: deployment/deployV2.yml
+          resource-name: deployment/covid19-analysis
+      - kubernetes/create-or-update-resource:
+          resource-file-path: deployment/app-service.yml
+      - run:
+         command: |
+            kubectl rollout status deployment covid19-analysis
+            kubectl get deployment covid19-analysis
+
+  test-application:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+      aws-region:
+        description: |
+          AWS region
+        type: string
+        default: ""
+    steps:
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - run:
+          name: Wait for service to be ready
+          command: |
+            kubectl get pods
+            kubectl get services
+            sleep 30
+            for attempt in {1..20}; do
+              EXTERNAL_IP=$(kubectl get service covid19analysis | awk '{print $4}' | tail -n1)
+              echo "Checking external IP: ${EXTERNAL_IP}"
+              if [ -n "${EXTERNAL_IP}" ] && [ -z $(echo "${EXTERNAL_IP}" | grep "pending") ]; then
+                break
+              fi
+              echo "Waiting for external IP to be ready: ${EXTERNAL_IP}"
+              sleep 10
+            done
+            sleep 180
+            curl -I -s --retry 10 "http://$EXTERNAL_IP" | grep HTTP
+
+  undeploy-application:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+      aws-region:
+        description: |
+          AWS region
+        type: string
+        default: ""
+    steps:
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - kubernetes/delete-resource:
+          resource-types: "deployment,service"
+          label-selector: "app=covid19-analysis"
+          wait: true
+      - run:
+          name: Check on pod status
+          command: |
+            kubectl get pods
+
+  delete-cluster:
+    executor: aws-eks/python3
+    steps:
+      - run:
+          name: Install the eksctl tool
+          command: |
+            if which eksctl > /dev/null; then
+              echo "eksctl is already installed"
+              exit 0
+            fi
+            mkdir -p eksctl_download
+            curl --silent --location --retry 5 "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+              | tar xz -C eksctl_download
+            chmod +x eksctl_download/eksctl
+            SUDO=""
+            if [ $(id -u) -ne 0 ] && which sudo > /dev/null ; then
+              SUDO="sudo"
+            fi
+            $SUDO mv eksctl_download/eksctl /usr/local/bin/
+            rmdir eksctl_download
+      - aws-eks/delete-cluster:
+          cluster-name: covid19-analysis
+          aws-region: $AWS_DEFAULT_REGION
+          wait: true
+
+
+
+orbs:
+  aws-eks: circleci/aws-eks@1.1.0
+  kubernetes: circleci/kubernetes@0.4.0
+  
+
+version: 2.1
+
+workflows:
+  deployment:
+    jobs:
+      - linting
+      - build-and-push-image:
+          requires:
+             - linting
+
+      - create-cluster:
+          requires:
+            - build-and-push-image
+      - test-cluster:
+          cluster-name: covid19-analysis
+          requires:
+            - create-cluster
+
+      - deploy-application:
+          cluster-name: covid19-analysis
+          aws-region: $AWS_DEFAULT_REGION
+          requires:
+            - test-cluster
+
+      - test-application:
+          name: test-application
+          cluster-name: covid19-analysis
+          aws-region: $AWS_DEFAULT_REGION
+          requires:
+            - deploy-application
+
+      - undeploy-application:
+          cluster-name: covid19-analysis
+          aws-region: $AWS_DEFAULT_REGION
+          requires:
+            - test-application
+
+      - delete-cluster:
+          requires:
+            - undeploy-application
+
